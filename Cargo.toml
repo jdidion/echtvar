@@ -44,6 +44,15 @@ flate2 = { version = "1", optional = true }
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 stream-vbyte = { version = "0.4.1", features = ["x86_ssse3", "x86_sse41"] }
 
+# Keep `target/` from ballooning: line tables still give file:line panics
+# and backtraces, but skip step-through variable info. Typically 40-60%
+# smaller `target/` for dev+test builds.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
