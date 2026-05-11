@@ -40,10 +40,6 @@ json5 = "0.4.1"
 ieee754 = "0.2"
 flate2 = { version = "1", optional = true }
 
-# x86 SIMD (Ssse3 decode, Sse41 encode) enabled only on x86_64; other arches use Scalar
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-stream-vbyte = { version = "0.4.1", features = ["x86_ssse3", "x86_sse41"] }
-
 # Keep `target/` from ballooning: line tables still give file:line panics
 # and backtraces, but skip step-through variable info. Typically 40-60%
 # smaller `target/` for dev+test builds.
