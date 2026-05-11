@@ -11,14 +11,12 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::BufReader;
 
 use stream_vbyte::decode::decode;
-#[cfg(target_arch = "x86_64")]
-use stream_vbyte::x86::Ssse3;
-#[cfg(not(target_arch = "x86_64"))]
 use stream_vbyte::scalar::Scalar;
 
-#[cfg(target_arch = "x86_64")]
-type StreamVbyteDecoder = Ssse3;
-#[cfg(not(target_arch = "x86_64"))]
+// Scalar decoder on every target. Was `Ssse3` on x86_64 behind a
+// feature-gated stream-vbyte dep, but that dep required
+// `#![feature(portable_simd)]` (nightly-only) on downstream consumers.
+// Decode is not on the hot path for typical annotation workloads.
 type StreamVbyteDecoder = Scalar;
 
 use ieee754::Ieee754;

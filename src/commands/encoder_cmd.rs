@@ -4,14 +4,11 @@ use rust_htslib::bcf::header::{HeaderRecord, TagLength, TagType};
 use rust_htslib::bcf::record::{Buffer, Record};
 use rust_htslib::bcf::{Read as BCFRead, Reader};
 use stream_vbyte::encode::encode;
-#[cfg(target_arch = "x86_64")]
-use stream_vbyte::x86::Sse41;
-#[cfg(not(target_arch = "x86_64"))]
 use stream_vbyte::scalar::Scalar;
 
-#[cfg(target_arch = "x86_64")]
-type StreamVbyteEncoder = Sse41;
-#[cfg(not(target_arch = "x86_64"))]
+// Scalar encoder on every target. Matches the decoder in src/lib/echtvar.rs.
+// SIMD encode is faster on x86_64 but requires nightly on downstream
+// consumers (portable_simd); encode is offline / cold-path for this use.
 type StreamVbyteEncoder = Scalar;
 
 use std::borrow::{Borrow, BorrowMut};
