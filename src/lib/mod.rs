@@ -1,3 +1,5 @@
+#[cfg(feature = "arrow")]
+pub mod arrowfmt;
 pub mod echtvar;
 pub mod fields;
 pub mod kmer16;

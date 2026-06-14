@@ -2,6 +2,8 @@ pub mod commands;
 
 use clap::{Parser, Subcommand};
 use commands::{annotate_cmd, encoder_cmd};
+#[cfg(feature = "arrow")]
+use commands::{arrow_cmd, bench_cmd};
 #[cfg(any(feature = "bed", feature = "tab"))]
 use commands::tab_annotate_cmd;
 use std::error::Error;
@@ -22,6 +24,34 @@ enum Commands {
     Encode(EncodeArgs),
     /// Annotate a VCF/BCF, BED, or tabular file with one or more echtvar files
     Anno(AnnoArgs),
+    /// (experimental) Convert a zip-format echtvar archive to Parquet
+    #[cfg(feature = "arrow")]
+    Arrow(ArrowArgs),
+    /// (experimental) Benchmark zip vs parquet per-variant lookup throughput
+    #[cfg(feature = "arrow")]
+    Bench(BenchArgs),
+}
+
+#[cfg(feature = "arrow")]
+#[derive(clap::Args)]
+struct ArrowArgs {
+    /// Input zip-format echtvar archive
+    #[arg(required = true)]
+    input: String,
+    /// Output Parquet file
+    #[arg(required = true)]
+    output: String,
+}
+
+#[cfg(feature = "arrow")]
+#[derive(clap::Args)]
+struct BenchArgs {
+    /// zip-format echtvar archive (source of truth + variant list)
+    #[arg(required = true)]
+    zip: String,
+    /// parquet file produced by `echtvar arrow`
+    #[arg(required = true)]
+    parquet: String,
 }
 
 #[derive(clap::Args)]
@@ -215,6 +245,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::Encode(args) => {
             let vcfs: Vec<&str> = args.vcfs.iter().map(String::as_str).collect();
             encoder_cmd::encoder_main(vcfs, &args.output, &args.json);
+        }
+        #[cfg(feature = "arrow")]
+        Commands::Arrow(args) => {
+            arrow_cmd::arrow_main(&args.input, &args.output)?;
+        }
+        #[cfg(feature = "arrow")]
+        Commands::Bench(args) => {
+            bench_cmd::bench_main(&args.zip, &args.parquet)?;
         }
         Commands::Anno(args) => {
             let echt_files: Vec<&str> = args.echtvar.iter().map(String::as_str).collect();
