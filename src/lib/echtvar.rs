@@ -419,6 +419,86 @@ impl EchtVars {
         results
     }
 
+    /// Enumerate every `(chrom, position_0based, ref_allele, alt_allele)` tuple
+    /// stored in the archive.
+    ///
+    /// Walks the zip file listing to discover every `(chrom, chunk_id)` pair
+    /// (chunk layout is `echtvar/{chrom_stripped}/{chunk_id}/...`), loads each
+    /// chunk via [`Self::set_position`], and decodes both the `var32`-packed
+    /// short variants and the `too-long-for-var32` long variants.
+    ///
+    /// `chrom` in the returned tuples is the stripped contig name (no `chr`
+    /// prefix) — matches echtvar's on-disk convention. Callers that need the
+    /// original `chr` prefix should attach it themselves.
+    ///
+    /// This is the region-enumeration helper that powers force-call injection
+    /// under `--variants`: a caller that wants every panel allele overlapping
+    /// a region materializes this vec once, groups by contig, and filters by
+    /// position at region-query time. Memory cost scales with panel size
+    /// (~40 bytes per tuple); a 34k-variant A45 panel is ~1.4 MB.
+    pub fn enumerate_all_alleles(&mut self) -> io::Result<Vec<(String, u32, Vec<u8>, Vec<u8>)>> {
+        // Collect unique (chrom, chunk_id) pairs by scanning zip entry names.
+        // Layout: `echtvar/{chrom_stripped}/{chunk_id}/var32.bin`. We key on
+        // var32.bin to avoid double-counting per-field value files.
+        let mut chunks: Vec<(String, u32)> = Vec::new();
+        {
+            for i in 0..self.zip.len() {
+                let entry = self.zip.by_index(i)?;
+                let name = entry.name().to_string();
+                // Accept only the var32.bin sentinel to enumerate chunks once.
+                if let Some(rest) = name.strip_prefix("echtvar/") {
+                    if let Some(stripped) = rest.strip_suffix("/var32.bin") {
+                        let mut parts = stripped.splitn(2, '/');
+                        let chrom = match parts.next() {
+                            Some(c) if !c.is_empty() => c.to_string(),
+                            _ => continue,
+                        };
+                        let chunk_str = match parts.next() {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        if let Ok(chunk_id) = chunk_str.parse::<u32>() {
+                            chunks.push((chrom, chunk_id));
+                        }
+                    }
+                }
+            }
+        }
+        // Sort so output order is stable (by contig name, then chunk id).
+        chunks.sort();
+
+        let mut out: Vec<(String, u32, Vec<u8>, Vec<u8>)> = Vec::new();
+        // Fresh synthetic rid per chunk-group so `set_position`'s cache check
+        // always reloads. Using i32::MIN+k as a non-colliding sentinel stream.
+        let mut synthetic_rid: i32 = i32::MIN;
+        let mut last_chrom: Option<String> = None;
+        for (chrom, chunk_id) in &chunks {
+            if last_chrom.as_deref() != Some(chrom.as_str()) {
+                synthetic_rid = synthetic_rid.saturating_add(1);
+                last_chrom = Some(chrom.clone());
+            }
+            let chunk_base: u32 = chunk_id << 20;
+            // `set_position` uses `position >> 20` as the chunk id, so hand it
+            // any position inside the chunk.
+            self.set_position(synthetic_rid, chrom.clone(), chunk_base)?;
+
+            // Short variants: var32s holds pos_in_chunk<<12 | enc, cumsum'd.
+            for &v in &self.var32s {
+                if let Some((r, a)) = var32::decode_to_alleles(v) {
+                    let pos_in_chunk = v >> 12;
+                    let pos = chunk_base | pos_in_chunk;
+                    out.push((chrom.clone(), pos, r, a));
+                }
+            }
+            // Long variants: each carries its absolute position explicitly.
+            for l in &self.longs {
+                let (r, a) = kmer16::decode_var(&l.sequence);
+                out.push((chrom.clone(), l.position, r, a));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn update_expr_values<T: Variant>(
         self: &mut EchtVars,
         variant: &mut T,
