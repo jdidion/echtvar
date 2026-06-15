@@ -128,10 +128,20 @@ impl ArrowWriterEchtvar {
         // single biggest size lever, the keys are ~63% of the file under the
         // default PLAIN encoding. Long-variant positions are also sorted.
         // DELTA_BINARY_PACKED requires the dictionary disabled for that column.
+        //
+        // zstd level is offline/cold-path, so a high level is cheap; allow an
+        // ECHTVAR_ZSTD override for sweeping. long_ref/long_alt are DNA strings
+        // with shared prefixes — DELTA_BYTE_ARRAY (incremental) beats PLAIN.
+        let zlevel: i32 = std::env::var("ECHTVAR_ZSTD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
         let var32_path = ColumnPath::from(COL_VAR32);
         let long_pos_path = ColumnPath::from(COL_LONG_POS);
+        let long_ref_path = ColumnPath::from(COL_LONG_REF);
+        let long_alt_path = ColumnPath::from(COL_LONG_ALT);
         let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(7)?))
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(zlevel)?))
             // each write() flushes one row group; keep the cap high so a chunk
             // is never split across row groups.
             .set_max_row_group_row_count(Some(1 << 30))
@@ -140,6 +150,10 @@ impl ArrowWriterEchtvar {
             .set_column_encoding(var32_path, Encoding::DELTA_BINARY_PACKED)
             .set_column_dictionary_enabled(long_pos_path.clone(), false)
             .set_column_encoding(long_pos_path, Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(long_ref_path.clone(), false)
+            .set_column_encoding(long_ref_path, Encoding::DELTA_BYTE_ARRAY)
+            .set_column_dictionary_enabled(long_alt_path.clone(), false)
+            .set_column_encoding(long_alt_path, Encoding::DELTA_BYTE_ARRAY)
             .build();
 
         let file = std::fs::File::create(path)?;
