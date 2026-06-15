@@ -33,8 +33,9 @@ use arrow::datatypes::{DataType, Field as ArrowField, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 
 use crate::fields;
 use crate::var32;
@@ -120,12 +121,23 @@ impl ArrowWriterEchtvar {
             ),
         ];
 
+        // Per-column encoding. The var32 key column is sorted within each chunk,
+        // so delta-pack it (mirrors the zip's delta + stream-vbyte) — this is the
+        // single biggest size lever, the keys are ~63% of the file under the
+        // default PLAIN encoding. Long-variant positions are also sorted.
+        // DELTA_BINARY_PACKED requires the dictionary disabled for that column.
+        let var32_path = ColumnPath::from(COL_VAR32);
+        let long_pos_path = ColumnPath::from(COL_LONG_POS);
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(7)?))
             // each write() flushes one row group; keep the cap high so a chunk
             // is never split across row groups.
             .set_max_row_group_row_count(Some(1 << 30))
             .set_key_value_metadata(Some(kv))
+            .set_column_dictionary_enabled(var32_path.clone(), false)
+            .set_column_encoding(var32_path, Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(long_pos_path.clone(), false)
+            .set_column_encoding(long_pos_path, Encoding::DELTA_BINARY_PACKED)
             .build();
 
         let file = std::fs::File::create(path)?;
