@@ -31,8 +31,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field as ArrowField, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
@@ -229,13 +231,17 @@ pub struct ArrowReaderEchtvar {
     long_pos_col_idx: usize,
     long_ref_col_idx: usize,
     long_alt_col_idx: usize,
+    /// Parsed footer metadata, loaded once and reused for every chunk read so
+    /// we don't reparse the footer per row group (918x on gnomAD).
+    arrow_meta: ArrowReaderMetadata,
 }
 
 impl ArrowReaderEchtvar {
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let file = std::fs::File::open(path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let meta = builder.metadata();
+        // Parse the footer once; reuse for every chunk read.
+        let arrow_meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+        let meta = arrow_meta.metadata().clone();
         let file_meta = meta.file_metadata();
 
         // parse config + strings from footer kv metadata.
@@ -281,7 +287,7 @@ impl ArrowReaderEchtvar {
         }
 
         // resolve arrow column indices by name.
-        let schema = builder.schema();
+        let schema = arrow_meta.schema();
         let col = |name: &str| -> Result<usize, Box<dyn std::error::Error>> {
             schema
                 .index_of(name)
@@ -332,6 +338,7 @@ impl ArrowReaderEchtvar {
             long_pos_col_idx,
             long_ref_col_idx,
             long_alt_col_idx,
+            arrow_meta,
         })
     }
 
@@ -362,18 +369,57 @@ impl ArrowReaderEchtvar {
     }
 
     /// Load a row group by its index (for sequential iteration over the whole
-    /// file). Opens a fresh file handle each call; the per-call open cost is
-    /// negligible relative to decoding a ~14k-row group.
+    /// file), decoding *all* field columns.
     pub fn load_row_group(
         &self,
         rg_i: usize,
     ) -> Result<ChunkData, Box<dyn std::error::Error>> {
+        self.load_row_group_projected(rg_i, None)
+    }
+
+    /// Load a row group, optionally decoding only a subset of the field columns.
+    /// `projection` is a set of field indices (into `self.fields`); `None` means
+    /// all fields. The var32 key column and the long-variant columns are always
+    /// decoded (they're needed to resolve any lookup). Field columns not in the
+    /// projection are returned as empty `values[fi]` vecs.
+    ///
+    /// Reuses the footer metadata parsed in `open` (via `new_with_metadata`), so
+    /// no per-chunk footer reparse. A fresh file handle is opened per call (a
+    /// cheap syscall relative to decoding a ~14k-row group).
+    pub fn load_row_group_projected(
+        &self,
+        rg_i: usize,
+        projection: Option<&[usize]>,
+    ) -> Result<ChunkData, Box<dyn std::error::Error>> {
         let file = std::fs::File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        // restrict to just this row group; read it whole in one batch.
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            file,
+            self.arrow_meta.clone(),
+        );
+
+        // Build a projection mask over leaf columns. Always include var32 +
+        // long_* ; include the requested field leaves (or all fields).
+        let parquet_schema = builder.parquet_schema();
+        let mut leaves: Vec<usize> = vec![
+            self.var32_col_idx,
+            self.long_pos_col_idx,
+            self.long_ref_col_idx,
+            self.long_alt_col_idx,
+        ];
+        let decode_fields: Vec<usize> = match projection {
+            Some(p) => p.to_vec(),
+            None => (0..self.fields.len()).collect(),
+        };
+        for &fi in &decode_fields {
+            leaves.push(self.field_col_idx[fi]);
+        }
+        // Our schema is flat (no nesting), so arrow column index == leaf index.
+        let mask = ProjectionMask::leaves(parquet_schema, leaves.iter().copied());
+
         let rg_meta_rows = builder.metadata().row_group(rg_i).num_rows() as usize;
         let reader = builder
             .with_row_groups(vec![rg_i])
+            .with_projection(mask)
             .with_batch_size(rg_meta_rows.max(1))
             .build()?;
 
@@ -384,38 +430,46 @@ impl ArrowReaderEchtvar {
         for batch in reader {
             let batch = batch?;
             let base = var32s.len();
+            // With a projection, the batch only contains the projected columns,
+            // in schema order. Resolve each needed column by NAME so absolute
+            // indices don't matter.
+            let schema = batch.schema();
+            let by_name = |b: &arrow::record_batch::RecordBatch, name: &str| {
+                schema.index_of(name).ok().map(|i| b.column(i).clone())
+            };
 
-            let v = batch
-                .column(self.var32_col_idx)
+            let v_col = by_name(&batch, COL_VAR32).ok_or("var32 column missing")?;
+            let v = v_col
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .ok_or("var32 column type mismatch")?;
             var32s.extend(v.values().iter().copied());
 
-            for (fi, &ci) in self.field_col_idx.iter().enumerate() {
-                let col = batch
-                    .column(ci)
+            for &fi in &decode_fields {
+                let name = self.fields[fi].alias.as_str();
+                let col = by_name(&batch, name).ok_or("field column missing")?;
+                let col = col
                     .as_any()
                     .downcast_ref::<UInt32Array>()
                     .ok_or("field column type mismatch")?;
                 values[fi].extend(col.values().iter().copied());
             }
 
-            let lpos = batch
-                .column(self.long_pos_col_idx)
+            let lpos_col = by_name(&batch, COL_LONG_POS).ok_or("long_pos missing")?;
+            let lref_col = by_name(&batch, COL_LONG_REF).ok_or("long_ref missing")?;
+            let lalt_col = by_name(&batch, COL_LONG_ALT).ok_or("long_alt missing")?;
+            let lpos = lpos_col
                 .as_any()
                 .downcast_ref::<UInt32Array>()
-                .ok_or("long_pos column type mismatch")?;
-            let lref = batch
-                .column(self.long_ref_col_idx)
+                .ok_or("long_pos type mismatch")?;
+            let lref = lref_col
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or("long_ref column type mismatch")?;
-            let lalt = batch
-                .column(self.long_alt_col_idx)
+                .ok_or("long_ref type mismatch")?;
+            let lalt = lalt_col
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or("long_alt column type mismatch")?;
+                .ok_or("long_alt type mismatch")?;
             for row in 0..batch.num_rows() {
                 if lpos.is_valid(row) && lref.is_valid(row) {
                     longs.insert(
