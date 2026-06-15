@@ -30,6 +30,17 @@ enum Commands {
     /// (experimental) Benchmark zip vs parquet per-variant lookup throughput
     #[cfg(feature = "arrow")]
     Bench(BenchArgs),
+    /// (experimental) Print per-column sizes/encodings of a parquet echtvar file
+    #[cfg(feature = "arrow")]
+    Pqstat(PqstatArgs),
+}
+
+#[cfg(feature = "arrow")]
+#[derive(clap::Args)]
+struct PqstatArgs {
+    /// parquet file produced by `echtvar arrow`
+    #[arg(required = true)]
+    parquet: String,
 }
 
 #[cfg(feature = "arrow")]
@@ -253,6 +264,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         #[cfg(feature = "arrow")]
         Commands::Bench(args) => {
             bench_cmd::bench_main(&args.zip, &args.parquet)?;
+        }
+        #[cfg(feature = "arrow")]
+        Commands::Pqstat(args) => {
+            arrow_cmd::pqstat_main(&args.parquet)?;
         }
         Commands::Anno(args) => {
             let echt_files: Vec<&str> = args.echtvar.iter().map(String::as_str).collect();

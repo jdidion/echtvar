@@ -40,6 +40,62 @@ fn discover_chunks(e: &mut EchtVars) -> std::io::Result<Vec<(String, u32)>> {
     Ok(chunks)
 }
 
+/// Print per-column compressed/uncompressed sizes and encodings for a parquet
+/// file, summed across all row groups. Diagnostic for the size investigation.
+pub fn pqstat_main(ppath: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(ppath)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let meta = builder.metadata();
+    let nrg = meta.num_row_groups();
+    let ncols = meta.file_metadata().schema_descr().num_columns();
+
+    let mut names: Vec<String> = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        names.push(meta.file_metadata().schema_descr().column(c).path().string());
+    }
+    let mut comp = vec![0i64; ncols];
+    let mut uncomp = vec![0i64; ncols];
+    let mut encs: Vec<std::collections::BTreeSet<String>> =
+        (0..ncols).map(|_| std::collections::BTreeSet::new()).collect();
+
+    for rg in meta.row_groups() {
+        for (c, col) in rg.columns().iter().enumerate() {
+            comp[c] += col.compressed_size();
+            uncomp[c] += col.uncompressed_size();
+            for e in col.encodings() {
+                encs[c].insert(format!("{:?}", e));
+            }
+        }
+    }
+    let tot_c: i64 = comp.iter().sum();
+    let tot_u: i64 = uncomp.iter().sum();
+
+    println!(
+        "{:30} {:>11} {:>12} {:>6}  encodings",
+        "column", "comp(MB)", "uncomp(MB)", "ratio"
+    );
+    for c in 0..ncols {
+        println!(
+            "{:30} {:>11.2} {:>12.2} {:>6.2}  {}",
+            names[c],
+            comp[c] as f64 / 1e6,
+            uncomp[c] as f64 / 1e6,
+            uncomp[c] as f64 / (comp[c].max(1) as f64),
+            encs[c].iter().cloned().collect::<Vec<_>>().join(",")
+        );
+    }
+    println!(
+        "{:30} {:>11.2} {:>12.2}",
+        "TOTAL",
+        tot_c as f64 / 1e6,
+        tot_u as f64 / 1e6
+    );
+    println!("rows={} row_groups={}", meta.file_metadata().num_rows(), nrg);
+    Ok(())
+}
+
 pub fn arrow_main(zpath: &str, opath: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut e = EchtVars::open(zpath);
 
