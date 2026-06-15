@@ -200,6 +200,102 @@ pub fn bench_main(zpath: &str, ppath: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Sequential bench: the workload `anno` over a sorted VCF actually does. Walk
+/// every row group (chunk) in order, decode it once, then look up every variant
+/// in that chunk (the in-order, no-revisit access pattern). We time chunk-load
+/// (column decode, amortized once per chunk) separately from per-variant search
+/// (binary_search + field index), because for sequential annotation the load
+/// cost is paid once per ~14k variants while the search cost is paid per
+/// variant. Reports both the combined rate and the search-only rate.
+pub fn bench_sequential_main(
+    zpath: &str,
+    ppath: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("[seq] enumerating variants from {}", zpath);
+    let mut e = EchtVars::open(zpath);
+    // Group the enumerated variants by (chrom, chunk) so we can drive each
+    // chunk's lookups against the matching row group.
+    let all = e.enumerate_all_alleles()?;
+    let n_fields = e.fields.len();
+    eprintln!("[seq] {} variants across the file", all.len());
+
+    // index the enumerated variants by (chrom, chunk_id) -> slice range. `all`
+    // is already sorted by (chrom, chunk, ...) from enumerate_all_alleles.
+    let pr = ArrowReaderEchtvar::open(ppath)?;
+    let flds = pr.fields.clone();
+
+    // group variant indices by (chrom, chunk)
+    let mut groups: Vec<(String, u32, usize, usize)> = Vec::new(); // chrom, chunk, start, end
+    {
+        let mut i = 0usize;
+        while i < all.len() {
+            let (ref chrom, pos, _, _) = all[i];
+            let chunk = pos >> 20;
+            let start = i;
+            while i < all.len() {
+                let (ref c2, p2, _, _) = all[i];
+                if c2 != chrom || p2 >> 20 != chunk {
+                    break;
+                }
+                i += 1;
+            }
+            groups.push((chrom.clone(), chunk, start, i));
+        }
+    }
+    eprintln!("[seq] {} chunks", groups.len());
+
+    let mut load_ns: u128 = 0;
+    let mut search_ns: u128 = 0;
+    let mut warn = 0i32;
+    let mut out = vec![0u32; n_fields];
+    let mut hits = 0u64;
+    let mut long_index: HashMap<(u32, Vec<u8>, Vec<u8>), usize> = HashMap::new();
+
+    let wall = Instant::now();
+    for (chrom, chunk, start, end) in &groups {
+        let tl = Instant::now();
+        let cd = match pr.load_chunk(chrom, *chunk)? {
+            Some(c) => c,
+            None => continue,
+        };
+        long_index.clear();
+        for (ord, (lpos, lref, lalt)) in cd.longs.iter() {
+            long_index.insert((*lpos, lref.clone(), lalt.clone()), *ord);
+        }
+        load_ns += tl.elapsed().as_nanos();
+
+        let ts = Instant::now();
+        for k in *start..*end {
+            let (_, pos, ref r, ref a) = all[k];
+            if parquet_lookup(&cd, &long_index, &flds, pos, r, a, &mut out, &mut warn) {
+                hits += 1;
+            }
+        }
+        search_ns += ts.elapsed().as_nanos();
+    }
+    let wall_ms = wall.elapsed().as_millis().max(1);
+
+    let n = all.len() as u128;
+    let load_ms = (load_ns / 1_000_000).max(1);
+    let search_ms = (search_ns / 1_000_000).max(1);
+    eprintln!("[seq] parquet sequential over {} variants, {} hits", n, hits);
+    eprintln!(
+        "[seq]   chunk-load (decode, amortized): {} ms total",
+        load_ms
+    );
+    eprintln!(
+        "[seq]   per-variant search only       : {} ms ({} /sec)",
+        search_ms,
+        1000 * n / search_ms
+    );
+    eprintln!(
+        "[seq]   combined wall                 : {} ms ({} /sec)",
+        wall_ms,
+        1000 * n / wall_ms
+    );
+    Ok(())
+}
+
 /// Decode a raw stored u32 exactly as the zip reader's `get_int_value` /
 /// `get_float_value` would, returning the value in the same u32-bits form that
 /// the bench captures from `EchtVars::evalues`:

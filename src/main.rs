@@ -63,6 +63,10 @@ struct BenchArgs {
     /// parquet file produced by `echtvar arrow`
     #[arg(required = true)]
     parquet: String,
+    /// Sequential mode: walk chunks in order (the `anno`-over-sorted-VCF
+    /// workload), reporting amortized chunk-load vs per-variant search timing
+    #[arg(long = "seq")]
+    seq: bool,
 }
 
 #[derive(clap::Args)]
@@ -263,7 +267,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         #[cfg(feature = "arrow")]
         Commands::Bench(args) => {
-            bench_cmd::bench_main(&args.zip, &args.parquet)?;
+            if args.seq {
+                bench_cmd::bench_sequential_main(&args.zip, &args.parquet)?;
+            } else {
+                bench_cmd::bench_main(&args.zip, &args.parquet)?;
+            }
         }
         #[cfg(feature = "arrow")]
         Commands::Pqstat(args) => {

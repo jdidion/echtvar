@@ -353,7 +353,21 @@ impl ArrowReaderEchtvar {
             Some(i) => *i,
             None => return Ok(None),
         };
+        self.load_row_group(rg_i).map(Some)
+    }
 
+    /// Number of row groups (== number of chunks) in the file, in file order.
+    pub fn num_row_groups(&self) -> usize {
+        self.rg_index.len()
+    }
+
+    /// Load a row group by its index (for sequential iteration over the whole
+    /// file). Opens a fresh file handle each call; the per-call open cost is
+    /// negligible relative to decoding a ~14k-row group.
+    pub fn load_row_group(
+        &self,
+        rg_i: usize,
+    ) -> Result<ChunkData, Box<dyn std::error::Error>> {
         let file = std::fs::File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         // restrict to just this row group; read it whole in one batch.
@@ -416,11 +430,11 @@ impl ArrowReaderEchtvar {
             }
         }
 
-        Ok(Some(ChunkData {
+        Ok(ChunkData {
             var32s,
             values,
             longs,
-        }))
+        })
     }
 }
 
