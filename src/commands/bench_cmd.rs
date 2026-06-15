@@ -155,30 +155,27 @@ pub fn bench_main(zpath: &str, ppath: &str) -> Result<(), Box<dyn std::error::Er
         };
         if found {
             hits += 1;
-            // compare against zip's raw values for this variant.
+            // Compare decoded-to-decoded: zip_vals[i] already holds the zip
+            // reader's *decoded* value (as u32 bits). Decode the parquet raw
+            // value the same way the zip reader does, then compare. This makes
+            // the missing-sentinel and zigzag/multiplier handling symmetric.
             for fi in 0..n_fields {
-                // floats are stored as the same u32 bits in both; ints match
-                // when not the missing sentinel. We compare the raw u32.
-                let zv = zip_vals[i][fi];
-                // zip stores Value::Int(missing) as the *decoded* missing_value;
-                // for hits both should agree on the raw stored u32 unless missing.
-                if out[fi] != zv && zv != u32::MAX {
-                    // allow mismatch only where zip applied missing/zigzag decode;
-                    // for a hit on a non-missing value the raw u32s should match.
-                    if !is_decoded_equivalent(&flds[fi], out[fi], zv) {
-                        mism += 1;
-                        if mism <= 5 {
-                            eprintln!(
-                                "[bench] MISMATCH {}:{} {}/{} field {} parquet_raw={} zip={}",
-                                chrom,
-                                pos + 1,
-                                String::from_utf8_lossy(r),
-                                String::from_utf8_lossy(a),
-                                flds[fi].alias,
-                                out[fi],
-                                zv
-                            );
-                        }
+                let zip_decoded = zip_vals[i][fi];
+                let pq_decoded = decode_like_zip(&flds[fi], out[fi]);
+                if pq_decoded != zip_decoded {
+                    mism += 1;
+                    if mism <= 5 {
+                        eprintln!(
+                            "[bench] MISMATCH {}:{} {}/{} field {} parquet_decoded={} zip_decoded={} (raw={})",
+                            chrom,
+                            pos + 1,
+                            String::from_utf8_lossy(r),
+                            String::from_utf8_lossy(a),
+                            flds[fi].alias,
+                            pq_decoded,
+                            zip_decoded,
+                            out[fi]
+                        );
                     }
                 }
             }
@@ -203,30 +200,41 @@ pub fn bench_main(zpath: &str, ppath: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// The zip reader applies missing-value / zigzag / multiplier decode in
-/// `get_int_value`/`get_float_value`, so the value pulled from `evalues` is the
-/// *decoded* form, while the parquet bench pulls the *raw stored* u32. They are
-/// equivalent when applying the same decode. This checks that relationship so a
-/// raw!=decoded difference isn't reported as a real mismatch.
-fn is_decoded_equivalent(fld: &fields::Field, raw: u32, zip_decoded: u32) -> bool {
+/// Decode a raw stored u32 exactly as the zip reader's `get_int_value` /
+/// `get_float_value` would, returning the value in the same u32-bits form that
+/// the bench captures from `EchtVars::evalues`:
+///   - Integer/Categorical/Flag: decoded i32 cast to u32
+///   - Float: f32::to_bits of the decoded float
+/// This includes the u32::MAX missing sentinel and the special 0x7F800001
+/// (VCF-missing) float case, so the comparison is decoded-to-decoded and
+/// symmetric across the two readers.
+fn decode_like_zip(fld: &fields::Field, raw: u32) -> u32 {
     use echtvar_lib::zigzag;
+    use ieee754::Ieee754;
     match fld.ftype {
         fields::FieldType::Float => {
-            // zip_decoded here is f32::to_bits of (decode(raw)/multiplier).
-            let f = if fld.zigzag {
+            let f: f32 = if raw == u32::MAX {
+                if fld.missing_value == 0x7F800001 {
+                    Ieee754::from_bits(0x7F800001u32)
+                } else {
+                    fld.missing_value as f32
+                }
+            } else if fld.zigzag {
                 (zigzag::decode(raw) as f32) / (fld.multiplier as f32)
             } else {
                 (raw as f32) / (fld.multiplier as f32)
             };
-            f.to_bits() == zip_decoded
+            f.to_bits()
         }
         _ => {
-            let dec = if fld.zigzag {
-                zigzag::decode(raw) as u32
+            let i: i32 = if raw == u32::MAX {
+                fld.missing_value
+            } else if fld.zigzag {
+                zigzag::decode(raw)
             } else {
-                raw
+                raw as i32
             };
-            dec == zip_decoded
+            i as u32
         }
     }
 }
